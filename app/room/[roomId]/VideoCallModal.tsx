@@ -44,7 +44,20 @@ export default function VideoCallModal() {
 		}
 		attach()
 		const off = onRemoteVideo((id) => { if (id === activeWith) attach() })
-		return () => off()
+		// retry a few times to catch late local/remote streams on caller side
+		let tries = 0
+		const iv = setInterval(() => {
+			tries += 1
+			if (!activeWith) return
+			attach()
+			const localReady = !!localRef.current?.srcObject
+			const remoteReady = !!remoteRef.current?.srcObject
+			if (localReady && remoteReady) {
+				clearInterval(iv)
+			}
+			if (tries > 10) clearInterval(iv)
+		}, 300)
+		return () => { off(); clearInterval(iv) }
 	}, [activeWith])
 
 	const accept = useCallback(async () => {
