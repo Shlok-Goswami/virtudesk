@@ -366,7 +366,7 @@ export async function setParticipantBlobChunk(id: string, blob: Blob, timestamp:
   // Auto-initialize meeting if not already initialized
   if (!meetingStartTime) {
     console.warn(`⚠️ Meeting not initialized when chunk received. Auto-initializing...`)
-    meetingStartTime = timestamp - 60000 // Assume meeting started 1 minute before first chunk
+    meetingStartTime = timestamp // Use actual first chunk timestamp as start time
     console.log('🟢 Meeting auto-initialized at', new Date(meetingStartTime).toISOString())
   }
 
@@ -428,12 +428,20 @@ export async function stopMeeting(roomId: string): Promise<MeetingSummary | null
   console.log('🔍 Current meetingStartTime:', meetingStartTime);
   console.log('🔍 Current participants:', Object.keys(participantData));
   
-  // If meeting wasn't initialized, try to initialize it now with current time
-  // This handles cases where the meeting flow didn't properly call Init()
+  // If meeting wasn't initialized, calculate from participant data
   if (!meetingStartTime) {
-    console.warn('⚠️ Meeting start time not set. Initializing with current time...');
-    meetingStartTime = Date.now() - 60000; // Assume meeting started 1 minute ago as fallback
-    console.log('🟢 Meeting initialized with fallback start time:', new Date(meetingStartTime).toISOString());
+    console.warn('⚠️ Meeting start time not set. Calculating from participant data...');
+    const participants = Object.values(participantData);
+    // Use the earliest participant offset as the start time
+    if (participants.length > 0) {
+      const earliestOffset = Math.min(...participants.map(p => p.offset));
+      meetingStartTime = earliestOffset;
+      console.log('🟢 Meeting start time calculated from earliest participant:', new Date(meetingStartTime).toISOString());
+    } else {
+      // Last resort: use current time (no extra time added)
+      meetingStartTime = Date.now();
+      console.log('🟢 Meeting initialized with current time (no participants found):', new Date(meetingStartTime).toISOString());
+    }
   }
 
   const participants = Object.values(participantData);
