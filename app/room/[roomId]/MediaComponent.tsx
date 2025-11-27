@@ -284,14 +284,9 @@ recorder.current.onstop = async () => {
     console.log("⏱️ Duration:", (summary.duration / 60000).toFixed(1), "minutes");
     console.groupEnd();
 
-    saveMeetingSummary(summary, props.roomId)
-      .then(() => {
-        console.log("✅ Meeting summary saved to Supabase successfully!");
-        alert("✅ Meeting summary saved! Check your Supabase table.");
-      })
-      .catch((error) => {
-        console.error("❌ Error saving summary to Supabase:", error);
-      });
+    // Note: stopMeeting already calls saveMeetingSummary internally, so we don't need to call it again
+    // But we can show a success message
+    console.log("✅ Meeting summary processed! Check your Supabase table for the saved entry.");
   })
   .catch((error) => {
     console.error("❌ Error generating meeting summary:", error);
