@@ -2,7 +2,8 @@
 import React, { useState,useEffect,useCallback,useRef, Ref, RefObject, CSSProperties } from "react";
 import {MODE,ModeType,destroyRealtime,participantType,registerSetMode,setModeState,setStreamState,startSignaling,RTCEventEmitter,registerSetParticipants,
         broadcastModeChange,broadCastUserNames,setCurrentStateName,registerSetUserNames,broadcastMeetingState,registerSetIsMeeting,
-        sendMeetingInvite,getMyId,registerSetShowInviteNotification,renegotiate,handleMute,getSelfId
+        sendMeetingInvite,getMyId,registerSetShowInviteNotification,renegotiate,handleMute,getSelfId,sendJoinMeetingRequest,sendJoinMeetingResponse,
+        registerSetShowJoinRequestNotification,getAllPlayers
     } from "../../../game/realtime/PlayerRealtime"
 import { useUser, useAuth, useOrganization } from '@clerk/nextjs';
 import LeaveRoomButton from './LeaveRoomButton';
@@ -10,9 +11,19 @@ import { error } from "console";
 // Math from phaser conflicts with native Math, using native Math directly
 import { Mic, MicOff, PenSquare, PhoneOff, Video } from "lucide-react";
 import { Span } from "next/dist/trace";
-import {Init , participantDataType,setNewParticipantServerAction,setParticipantBlobChunk,setParticipantOffset,stopMeeting,stopRecorder,type MeetingSummary, saveMeetingSummary
+import {
+  Init,
+  participantDataType,
+  setNewParticipantServerAction,
+  setParticipantBlobChunk,
+  stopMeeting,
+  stopRecorder,
+  type MeetingSummary,
+  saveMeetingSummary
+} from "@/app/actions/Summary";
 
-} from "./../../actions/Summary"
+
+
 import { set } from "react-hook-form";
 import { CollaborativeWhiteboardProps } from "@/components/CollaborativeWhiteboard";
 
@@ -58,6 +69,9 @@ export default function  MediaComponent(props:propType){
     const [showInviteNotification,setShowInviteNotification]=useState<boolean>(false)
     const [isMuted,setIsMuted]=useState<boolean>(false)
     const [members, setMembers] = useState<Array<{ id: string; name: string; role: string; }>>([])
+    const [meetingHost, setMeetingHost] = useState<string | null>(null)
+    const [joinRequestNotification, setJoinRequestNotification] = useState<{name:string,id:string} | null>(null)
+    const [roomPlayers, setRoomPlayers] = useState<Array<{ id: string; name?: string; character?: string; avatar?: string }>>([])
     
     
     function updateMode(m:ModeType){
@@ -115,27 +129,38 @@ export default function  MediaComponent(props:propType){
             return;
         }
         
+        // Get participant name from members list or user data
+        let participantName = '';
+        if (members.length > 0 && user) {
+            const currentUserMember = members.find(m => m.id === user.id);
+            participantName = currentUserMember?.name || user.fullName || user.username || user.primaryEmailAddress?.emailAddress || '';
+        } else if (user) {
+            participantName = user.fullName || user.username || user.primaryEmailAddress?.emailAddress || '';
+        }
+        
         // Store in ref for debugging, but use the closure variable for actual operations
         currentParticipantIdRef.current = participantId;
         
         // Log the ID we're using
-        console.log(`[${participantId}] Starting recorder. getSelfId() returned:`, participantId);
-        console.log(`[${participantId}] This ID will be used for all chunks and stopRecorder`);
+        const logName = participantName || participantId;
+        console.log(`[${logName} (${participantId})] Starting recorder. getSelfId() returned:`, participantId);
+        console.log(`[${logName} (${participantId})] This ID will be used for all chunks and stopRecorder`);
         
         const n:participantDataType={
             id: participantId, // Use the captured participantId
+            name: participantName || undefined, // Include name if available
             offset:Date.now(),
             chunks:[],
             isFinished:false
         }
         
-        console.log(`[${participantId}] Participant data created with ID: ${n.id}`);
+        console.log(`[${logName} (${participantId})] Participant data created with ID: ${n.id}`);
         
         // Set participant BEFORE creating recorder
         await setNewParticipantServerAction(n);
         
         // Log that participant was set
-        console.log(`[${participantId}] ✅ Participant set with ID: ${n.id}`);
+        console.log(`[${logName} (${participantId})] ✅ Participant set with ID: ${n.id}`);
         
         // Use audio-only stream for recording
         recorder.current = new MediaRecorder(audioOnlyStream, {
@@ -152,39 +177,47 @@ export default function  MediaComponent(props:propType){
             if(e.data && e.data.size > 0){
                 // ALWAYS use the captured participantId from closure
                 const currentGetSelfId = getSelfId();
-                console.log(`[${recordingParticipantId}] Data available: ${e.data.size} bytes`);
+                const timestamp = Date.now(); // Get current timestamp when chunk is available
+                console.log(`[${recordingParticipantId}] Data available: ${e.data.size} bytes at timestamp: ${timestamp}`);
                 console.log(`[${recordingParticipantId}] Using ID: ${recordingParticipantId}, getSelfId() now: ${currentGetSelfId}`);
                 
                 if(recordingParticipantId !== currentGetSelfId){
                     console.warn(`[${recordingParticipantId}] ⚠️ ID mismatch! Using captured ID: ${recordingParticipantId}, getSelfId() returned: ${currentGetSelfId}`);
                 }
                 
-                await setParticipantBlobChunk(recordingParticipantId, e.data).catch((error) => {
+                await setParticipantBlobChunk(recordingParticipantId, e.data, timestamp).catch((error) => {
                     console.error(`[${recordingParticipantId}] Error setting participant blob chunk:`, error);
                 });
             }
         }
         
-        recorder.current.onstop = async () => {
-            // ALWAYS use the captured participantId from closure
-            const currentGetSelfId = getSelfId();
-            console.log(`[${recordingParticipantId}] Recorder stopped`);
-            console.log(`[${recordingParticipantId}] Using ID: ${recordingParticipantId}, getSelfId() now: ${currentGetSelfId}`);
-            
-            if(recordingParticipantId !== currentGetSelfId){
-                console.warn(`[${recordingParticipantId}] ⚠️ ID mismatch! Using captured ID: ${recordingParticipantId}, getSelfId() returned: ${currentGetSelfId}`);
-            }
-            
-            const result = await stopRecorder(recordingParticipantId, Date.now());
-            if(result){
-                console.log(`[${recordingParticipantId}] Transcription result:`, result.text?.substring(0, 100));
-            } else {
-                console.error(`[${recordingParticipantId}] stopRecorder returned null`);
-            }
-            // Clear the ref when done
-            currentParticipantIdRef.current = null;
-        }
-    },[recorder])
+recorder.current.onstop = async () => {
+  const currentGetSelfId = getSelfId();
+  console.log(`[${recordingParticipantId}] Recorder stopped at ${new Date().toISOString()}`);
+  console.log(`[${recordingParticipantId}] Using ID: ${recordingParticipantId}, getSelfId() now: ${currentGetSelfId}`);
+
+  if (recordingParticipantId !== currentGetSelfId) {
+    console.warn(`[${recordingParticipantId}] ⚠️ ID mismatch! Using captured ID: ${recordingParticipantId}, getSelfId() returned: ${currentGetSelfId}`);
+  }
+
+  try {
+    const result = await stopRecorder(recordingParticipantId, Date.now());
+    if (!result) {
+      console.error(`[${recordingParticipantId}] ❌ stopRecorder returned null — likely no chunks were processed.`);
+    } else if (!result.text || result.text.trim().length === 0) {
+      console.warn(`[${recordingParticipantId}] ⚠️ Transcription was empty or failed.`);
+    } else {
+      console.log(`🎤 [${result.name || recordingParticipantId}] Transcript:\n${result.text.slice(0, 200)}${result.text.length > 200 ? "..." : ""}`);
+    }
+  } catch (err) {
+    console.error(`[${recordingParticipantId}] 🚨 Error in stopRecorder:`, err);
+  } finally {
+    currentParticipantIdRef.current = null;
+  }
+};
+
+
+    },[recorder, members, user])
     const handleStartMeeting=useCallback(async ()=>{
         await Init(Date.now());
         const newStream:MediaStream=await getUserMedia({audio:true,video:true});
@@ -192,12 +225,17 @@ export default function  MediaComponent(props:propType){
 
         updateMode(MODE.MEETING)
         broadcastModeChange(MODE.MEETING)
-        broadcastMeetingState(true)
+        const hostId = user?.id || getSelfId() || undefined
+        broadcastMeetingState(true, hostId)
         props.set(true)
         setIsMeeting(true)
+        // Set current user as meeting host
+        if (hostId) {
+            setMeetingHost(hostId)
+        }
         renegotiate(newStream,MODE.MEETING);
         
-    },[])
+    },[user])
     const handleJoinMeeting=useCallback(async ()=>{
         const newStream:MediaStream=await getUserMedia({audio:true,video:true});
         await handleRecorder(newStream)
@@ -213,39 +251,54 @@ export default function  MediaComponent(props:propType){
         const newStream : MediaStream= await getUserMedia({audio:true,video:false})
         updateMode(MODE.PROXIMITY)
         broadcastModeChange(MODE.PROXIMITY)
-        let isPresent=false;
-        participants.forEach((p)=>{
-            if(p.mode===MODE.MEETING){
-                isPresent=true
-            }
-        })
-        if(isPresent){
-          
-        }
-        else{
-          
+        
+        // Check if there are other participants still in meeting (excluding self)
+        const selfId = getSelfId();
+        const otherParticipantsInMeeting = participants.filter((p) => 
+            p.mode === MODE.MEETING && p.id !== selfId && p.id !== user?.id
+        );
+        
+        // If no other participants are in meeting, end the meeting
+        if(otherParticipantsInMeeting.length === 0){
             broadcastMeetingState(false);
+            setMeetingHost(null); // Clear meeting host when meeting ends
+            setIsMeeting(false); // Explicitly set isMeeting to false
            
-            stopMeeting(props.roomId).then((summary: MeetingSummary | null) => {
-                if (summary) {
-                    console.log("Meeting Summary:", summary.summary);
-                    console.log("Key Points:", summary.keyPoints);
-                    console.log("Participants:", summary.participants);
-                    const durationMinutes = summary.duration / 60000;
-                    console.log("Duration:", Math.floor(durationMinutes) as number, "minutes");
-                    // Save to Supabase
-                    saveMeetingSummary(summary, props.roomId).catch((error) => {
-                        console.error("Error saving meeting summary:", error);
-                    });
-                }
-            }).catch((error) => {
-                console.error("Error generating meeting summary:", error);
-            });
+            stopMeeting(props.roomId)
+  .then((summary: MeetingSummary | null) => {
+    if (!summary) {
+      console.error("❌ No summary returned from stopMeeting()");
+      return;
+    }
+
+    console.groupCollapsed("📝 Meeting Summary Result");
+    console.log("📄 Summary Text:", summary.summary || "No summary text returned");
+    console.log("📌 Key Points:", summary.keyPoints?.length ? summary.keyPoints : ["(none)"]);
+    console.log(
+      "👥 Participants:",
+      summary.participants.map((id:string) => {
+        const name = summary.participantNames?.[id] || id;
+        return `${name} (${id})`;
+      })
+    );
+    console.log("⏱️ Duration:", (summary.duration / 60000).toFixed(1), "minutes");
+    console.groupEnd();
+
+    // Note: stopMeeting already calls saveMeetingSummary internally, so we don't need to call it again
+    // But we can show a success message
+    console.log("✅ Meeting summary processed! Check your Supabase table for the saved entry.");
+  })
+  .catch((error) => {
+    console.error("❌ Error generating meeting summary:", error);
+  });
+
         }
+        // If others are still in meeting, just leave (they will see Join Meeting button)
+        
         props.set(false)
         renegotiate(newStream,MODE.PROXIMITY);
 
-    },[participants, props.roomId])
+    },[participants, props.roomId, user])
 
     const handleInvite=useCallback((participantId: string)=>{
         sendMeetingInvite(participantId);
@@ -260,30 +313,52 @@ export default function  MediaComponent(props:propType){
         setShowInviteNotification(false);
     },[])
 
+    const handleRequestJoinMeeting=useCallback(()=>{
+        if (!meetingHost || !user) return;
+        // Get requester name from members or user data
+        const requesterMember = members.find(m => m.id === user.id);
+        const requesterName = requesterMember?.name || user.fullName || user.username || user.primaryEmailAddress?.emailAddress || 'Someone';
+        sendJoinMeetingRequest(meetingHost, requesterName);
+    },[meetingHost, user, members])
+
+    const handleAcceptJoinRequest=useCallback(()=>{
+        if (!joinRequestNotification) return;
+        sendJoinMeetingResponse(joinRequestNotification.id, true);
+        setJoinRequestNotification(null);
+    },[joinRequestNotification])
+
+    const handleRejectJoinRequest=useCallback(()=>{
+        if (!joinRequestNotification) return;
+        sendJoinMeetingResponse(joinRequestNotification.id, false);
+        setJoinRequestNotification(null);
+    },[joinRequestNotification])
+
     const registerEvents = useCallback(()=>{
         RTCEventEmitter.removeAllListeners("onTrack")
         RTCEventEmitter.on("onTrack",(from:string,track:MediaStreamTrack,mode:ModeType)=>{
-           
                 setParticipants((prev)=>{
                     let isPresent=false;
-                    prev.forEach((p)=>{
+                    const updated = prev.map((p)=>{
                         if(p.id===from){
                             isPresent=true;
-                            p.stream=new MediaStream([track])
+                            // Update stream with new track
+                            const newStream = new MediaStream([track]);
+                            return {...p, stream: newStream, mode: mode};
                         }
+                        return p;
                     })
                     if(isPresent){
-                        return [...prev]
+                        return updated;
                     }
                     else{
-                         let newParticipant:participantType={id:from,mode:mode,stream:new MediaStream([track])}
-                         return [...prev,newParticipant]
+                        // Participant not in list, add them
+                        let newParticipant:participantType={id:from,mode:mode,stream:new MediaStream([track])}
+                        return [...updated,newParticipant]
                     }
                 })
         })
         RTCEventEmitter.removeAllListeners("onMeetingTrack")
         RTCEventEmitter.on("onMeetingTrack",(from:string,track:MediaStreamTrack,mode:ModeType,flag:boolean)=>{
-           console.log("\n\n\wrfwn\n\n\nhiiiiiiiii\n\n\n\n\n\nfwf\n\n\n")
                 setParticipants((prev)=>{
                     let isPresent=false;
                     prev.forEach((p)=>{
@@ -320,6 +395,20 @@ export default function  MediaComponent(props:propType){
                 }
             })      
         })
+        RTCEventEmitter.removeAllListeners("onParticipantDisconnect");
+        RTCEventEmitter.on("onParticipantDisconnect",(participantId:string)=>{
+            setParticipants((prev)=>{
+                // Remove the participant who disconnected
+                const filtered = prev.filter(p => p.id !== participantId);
+                // Clean up video ref for disconnected participant
+                const element = videoRefs.current[participantId];
+                if(element){
+                    element.srcObject = null;
+                }
+                delete videoRefs.current[participantId];
+                return filtered;
+            })
+        })
     },[])
 
     
@@ -331,9 +420,19 @@ export default function  MediaComponent(props:propType){
         registerSetUserNames(setUserNames)
         registerSetIsMeeting(setIsMeeting)
         registerSetShowInviteNotification(setShowInviteNotification)
+        registerSetShowJoinRequestNotification(setJoinRequestNotification)
 
         getUserMediaInit();
         registerEvents()
+
+        // Listen for join meeting accepted/rejected events
+        RTCEventEmitter.on("join-meeting-accepted", async () => {
+            await handleJoinMeeting();
+        });
+        RTCEventEmitter.on("join-meeting-rejected", () => {
+            // Could show a notification that request was rejected
+            console.log("Join meeting request was rejected");
+        });
 
         return ()=>{
             registerSetMode(null);
@@ -341,6 +440,10 @@ export default function  MediaComponent(props:propType){
             registerSetUserNames(null)
             registerSetIsMeeting(null)
             registerSetShowInviteNotification(null)
+            registerSetShowJoinRequestNotification(null)
+            RTCEventEmitter.removeAllListeners("join-meeting-accepted")
+            RTCEventEmitter.removeAllListeners("join-meeting-rejected")
+            RTCEventEmitter.removeAllListeners("onParticipantDisconnect")
             RTCEventEmitter.removeAllListeners()
             recorder.current=null
         }
@@ -408,6 +511,49 @@ export default function  MediaComponent(props:propType){
         }
     }, [isLoaded, user, members]);
 
+    // Track meeting host when meeting state changes
+    useEffect(() => {
+        // Listen for meeting started/ended events
+        RTCEventEmitter.on("meeting-started", (hostId: string) => {
+            setMeetingHost(hostId);
+        });
+        RTCEventEmitter.on("meeting-ended", () => {
+            setMeetingHost(null);
+        });
+
+        return () => {
+            RTCEventEmitter.removeAllListeners("meeting-started");
+            RTCEventEmitter.removeAllListeners("meeting-ended");
+        };
+    }, [])
+
+    // Get all players in the room
+    useEffect(() => {
+        const refreshPlayers = () => {
+            const all = getAllPlayers();
+            const filtered = all.filter((p) => p.id);
+            setRoomPlayers(filtered);
+        };
+        
+        refreshPlayers();
+        const interval = setInterval(refreshPlayers, 1000);
+        return () => clearInterval(interval);
+    }, [])
+
+    // Update meeting state based on participants
+    useEffect(() => {
+        const participantsInMeeting = participants.filter(p => p.mode === MODE.MEETING);
+        const hasParticipantsInMeeting = participantsInMeeting.length > 0;
+        
+        // Update isMeeting state based on whether there are participants in meeting
+        if(hasParticipantsInMeeting && !isMeeting){
+            setIsMeeting(true);
+        } else if(!hasParticipantsInMeeting && isMeeting){
+            setIsMeeting(false);
+            setMeetingHost(null);
+        }
+    }, [participants, isMeeting])
+
     useEffect(()=>{
         if(mode===MODE.PROXIMITY){
         participants.forEach((p)=>{
@@ -427,7 +573,7 @@ export default function  MediaComponent(props:propType){
             participants.forEach((p)=>{
                 if(p.mode!==MODE.MEETING){return;}
                 const element=videoRefs.current[p.id];
-                if(!element){throw new Error("AUDIO ELEMENT is null in mediacompionent.tsx ")}
+                if(!element){throw new Error("VIDEO ELEMENT is null in mediacompionent.tsx ")}
                 else{
                     element.srcObject=p.stream
                 }
@@ -533,6 +679,86 @@ export default function  MediaComponent(props:propType){
             </div>
         </div>
     )}
+
+    {/* Join Meeting Request Notification */}
+    {joinRequestNotification && mode === MODE.MEETING && (
+        <div style={{
+            position:"fixed",
+            top:"2rem",
+            right:"2rem",
+            zIndex:2000,
+            padding:"1.25rem",
+            backgroundColor:"rgba(15, 23, 42, 0.95)",
+            backdropFilter:"blur(8px)",
+            borderRadius:"0.75rem",
+            border:"1px solid rgba(148, 163, 184, 0.15)",
+            boxShadow:"0 10px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.5)",
+            minWidth:"320px",
+            maxWidth:"400px"
+        }}>
+            <div style={{
+                display:"flex",
+                flexDirection:"column",
+                gap:"1rem"
+            }}>
+                <p style={{
+                    color:"rgba(241, 245, 249, 0.95)",
+                    fontSize:"0.875rem",
+                    margin:0
+                }}>
+                    {joinRequestNotification.name} wants to join the meeting
+                </p>
+                <div style={{
+                    display:"flex",
+                    gap:"0.75rem",
+                    justifyContent:"flex-end"
+                }}>
+                    <button
+                        onClick={handleRejectJoinRequest}
+                        style={{
+                            padding:"0.5rem 1rem",
+                            backgroundColor:"rgba(71, 85, 105, 0.6)",
+                            color:"rgba(241, 245, 249, 0.9)",
+                            border:"1px solid rgba(148, 163, 184, 0.2)",
+                            borderRadius:"0.5rem",
+                            fontSize:"0.875rem",
+                            fontWeight:"500",
+                            cursor:"pointer",
+                            transition:"all 0.2s ease-in-out"
+                        }}
+                        onMouseEnter={(e) => {
+                            e.currentTarget.style.backgroundColor = "rgba(71, 85, 105, 0.8)";
+                        }}
+                        onMouseLeave={(e) => {
+                            e.currentTarget.style.backgroundColor = "rgba(71, 85, 105, 0.6)";
+                        }}
+                    >Reject</button>
+                    <button
+                        onClick={handleAcceptJoinRequest}
+                        style={{
+                            padding:"0.5rem 1rem",
+                            backgroundColor:"rgba(34, 197, 94, 0.8)",
+                            color:"white",
+                            border:"none",
+                            borderRadius:"0.5rem",
+                            fontSize:"0.875rem",
+                            fontWeight:"500",
+                            cursor:"pointer",
+                            transition:"all 0.2s ease-in-out"
+                        }}
+                        onMouseEnter={(e) => {
+                            e.currentTarget.style.backgroundColor = "rgba(34, 197, 94, 1)";
+                            e.currentTarget.style.transform = "scale(1.05)";
+                        }}
+                        onMouseLeave={(e) => {
+                            e.currentTarget.style.backgroundColor = "rgba(34, 197, 94, 0.8)";
+                            e.currentTarget.style.transform = "scale(1)";
+                        }}
+                    >Accept</button>
+                </div>
+            </div>
+        </div>
+    )}
         
 
 
@@ -556,7 +782,8 @@ export default function  MediaComponent(props:propType){
                     className={"AudioElement"+participant.id}
                 ></audio>
             })}
-            {userRole!=="member" && !isMeeting && 
+            {/* Show Start Meeting button when no one is in meeting and user is not a member */}
+            {userRole!=="member" && mode !== MODE.MEETING && !participants.some(p => p.mode === MODE.MEETING) && 
              <button
              onClick={async (e) => { await handleStartMeeting() }}
              className={`fixed bottom-24 right-4 z-[1100] flex items-center justify-center gap-1.5 px-10.5 py-2.5 rounded-md border text-xs font-medium transition 
@@ -565,6 +792,18 @@ export default function  MediaComponent(props:propType){
          >
              <Video className="w-4 h-4" />
              <span className="text-sm font-medium">Start Meeting</span>
+         </button>
+            }
+            {/* Show Join Meeting button when at least one participant is in meeting and current user is not in meeting */}
+            {mode !== MODE.MEETING && participants.some(p => p.mode === MODE.MEETING) && meetingHost && 
+             <button
+             onClick={handleRequestJoinMeeting}
+             className={`fixed bottom-24 right-4 z-[1100] flex items-center justify-center gap-1.5 px-10.5 py-2.5 rounded-md border text-xs font-medium transition 
+                 bg-green-500 border-slate-200 text-white hover:bg-green-600
+                 disabled:opacity-50 disabled:cursor-not-allowed md:bottom-4 md:right-4 shadow-md`}
+         >
+             <Video className="w-4 h-4" />
+             <span className="text-sm font-medium">Join Meeting</span>
          </button>
             }
         </>
@@ -625,7 +864,21 @@ export default function  MediaComponent(props:propType){
                         overflowY:"auto",
                         overflowX:"hidden"
                     }}>
-                        {participants.length===0 && (
+                        <div style={{
+                            display:"flex",
+                            flexDirection:"column",
+                            gap:"0.5rem",
+                            marginBottom:"0.5rem"
+                        }}>
+                            <h3 style={{
+                                color:"rgba(241, 245, 249, 0.95)",
+                                fontSize:"0.875rem",
+                                fontWeight:"600",
+                                marginBottom:"0.25rem",
+                                padding:"0 0.25rem"
+                            }}>Participants ({roomPlayers.length})</h3>
+                        </div>
+                        {roomPlayers.length === 0 && (
                             <div style={{
                                 display:"flex",
                                 alignItems:"center",
@@ -637,85 +890,80 @@ export default function  MediaComponent(props:propType){
                                 textAlign:"center",
                                 width:"100%"
                             }}>
-                                No Participants Currently
+                                No Participants in Room
                             </div>
                         )}
-                        {participants.map((p)=>{
-                            // Get name from userNames (broadcast) or from members list as fallback
-                            const member = members.find(m => m.id === p.id);
-                            let u = userNames[p.id] || member?.name || "Unknown User";
+                        {roomPlayers.map((player)=>{
+                            // Get member info to check role
+                            const member = members.find(m => m.id === player.id);
+                            const playerRole = member?.role || "member";
+                            const playerName = userNames[player.id] || member?.name || player.name || "Unknown User";
+                            const isInMeeting = participants.some(p => p.id === player.id && p.mode === MODE.MEETING);
+                            const isCurrentUser = player.id === user?.id || player.id === getSelfId();
+                            // Admins and team_managers can invite anyone (including same roles), except themselves and those already in meeting
+                            const canInvite = userRole !== "member" && !isCurrentUser && !isInMeeting;
 
-                            return <React.Fragment key={p.id+"Names"}>
+                            return <React.Fragment key={player.id+"Participant"}>
                                 <div  className="participantHolder" style={{
                                     display:"flex",
                                     alignItems:"center",
                                     justifyContent:"space-between",
                                     padding:"0.75rem 1rem",
-                                    backgroundColor:"rgba(30, 41, 59, 0.6)",
+                                    backgroundColor:isInMeeting ? "rgba(34, 197, 94, 0.1)" : "rgba(30, 41, 59, 0.6)",
                                     borderRadius:"0.5rem",
-                                    border:"1px solid rgba(148, 163, 184, 0.15)",
+                                    border:isInMeeting ? "1px solid rgba(34, 197, 94, 0.3)" : "1px solid rgba(148, 163, 184, 0.15)",
                                     transition:"all 0.2s ease-in-out",
                                     gap:"0.75rem",
                                     minHeight:"3rem"
                                 }}>
-                                    <span style={{
-                                        color:"rgba(241, 245, 249, 0.95)",
-                                        fontSize:"0.875rem",
-                                        fontWeight:"500",
-                                        letterSpacing:"0.025em",
-                                        flex:"1",
-                                        overflow:"hidden",
-                                        textOverflow:"ellipsis",
-                                        whiteSpace:"nowrap"
-                                    }}>{u || "Unknown User"}</span>
-                                    {userRole!=="member"?
-                                     <button 
-                                        disabled={p.mode===MODE.MEETING}
-                                        onClick={()=>{handleInvite(p.id)}}
-                                        style={{
-                                            padding:"0.375rem 0.75rem",
-                                            backgroundColor:p.mode===MODE.MEETING ? "rgba(71, 85, 105, 0.5)" : "rgba(99, 102, 241, 0.8)",
-                                            color:p.mode===MODE.MEETING ? "rgba(148, 163, 184, 0.6)" : "white",
-                                            border:"none",
-                                            borderRadius:"0.375rem",
-                                            fontSize:"0.75rem",
-                                            fontWeight:"500",
-                                            cursor:p.mode===MODE.MEETING ? "not-allowed" : "pointer",
-                                            transition:"all 0.2s ease-in-out",
-                                            whiteSpace:"nowrap",
-                                            flexShrink:"0",
-                                            opacity:p.mode===MODE.MEETING ? 0.6 : 1
-                                        }}
-                                        onMouseEnter={(e) => {
-                                            if (p.mode !== MODE.MEETING) {
-                                                e.currentTarget.style.backgroundColor = "rgba(99, 102, 241, 1)";
-                                                e.currentTarget.style.transform = "scale(1.05)";
-                                            }
-                                        }}
-                                        onMouseLeave={(e) => {
-                                            if (p.mode !== MODE.MEETING) {
-                                                e.currentTarget.style.backgroundColor = "rgba(99, 102, 241, 0.8)";
-                                                e.currentTarget.style.transform = "scale(1)";
-                                            }
-                                        }}
-                                    >Invite</button>:
                                     <div style={{
-                                        padding:"0.375rem 0.75rem",
-                                        backgroundColor:p.mode===MODE.MEETING ? "rgba(34, 197, 94, 0.2)" : "rgba(71, 85, 105, 0.4)",
-                                        color:p.mode===MODE.MEETING ? "rgba(34, 197, 94, 0.9)" : "rgba(148, 163, 184, 0.7)",
-                                        border:"1px solid",
-                                        borderColor:p.mode===MODE.MEETING ? "rgba(34, 197, 94, 0.3)" : "rgba(148, 163, 184, 0.2)",
-                                        borderRadius:"0.375rem",
-                                        fontSize:"0.75rem",
-                                        fontWeight:"500",
-                                        whiteSpace:"nowrap",
-                                        flexShrink:"0",
                                         display:"flex",
-                                        alignItems:"center",
-                                        justifyContent:"center"
+                                        flexDirection:"column",
+                                        flex:"1",
+                                        minWidth:0
                                     }}>
-                                        {p.mode===MODE.MEETING ? "In Meeting" : "Available"}
-                                    </div>}
+                                        <span style={{
+                                            color:"rgba(241, 245, 249, 0.95)",
+                                            fontSize:"0.875rem",
+                                            fontWeight:"500",
+                                            letterSpacing:"0.025em",
+                                            overflow:"hidden",
+                                            textOverflow:"ellipsis",
+                                            whiteSpace:"nowrap"
+                                        }}>{playerName}</span>
+                                        <span style={{
+                                            color:isInMeeting ? "rgba(34, 197, 94, 0.8)" : "rgba(148, 163, 184, 0.6)",
+                                            fontSize:"0.75rem",
+                                            fontWeight:"400",
+                                            marginTop:"0.125rem"
+                                        }}>
+                                            {isInMeeting ? "In Meeting" : "Available"}
+                                        </span>
+                                    </div>
+                                    {canInvite && (
+                                        <button
+                                            onClick={() => handleInvite(player.id)}
+                                            style={{
+                                                padding:"0.375rem 0.75rem",
+                                                backgroundColor:"rgba(59, 130, 246, 0.1)",
+                                                border:"1px solid rgba(59, 130, 246, 0.3)",
+                                                borderRadius:"0.375rem",
+                                                color:"rgba(147, 197, 253, 0.9)",
+                                                fontSize:"0.75rem",
+                                                fontWeight:"500",
+                                                cursor:"pointer",
+                                                transition:"all 0.2s ease-in-out"
+                                            }}
+                                            onMouseEnter={(e) => {
+                                                e.currentTarget.style.backgroundColor = "rgba(59, 130, 246, 0.2)";
+                                            }}
+                                            onMouseLeave={(e) => {
+                                                e.currentTarget.style.backgroundColor = "rgba(59, 130, 246, 0.1)";
+                                            }}
+                                        >
+                                            Invite
+                                        </button>
+                                    )}
                                 </div>
                             </React.Fragment>
                         })}

@@ -5,7 +5,7 @@ import { useUser, useOrganization } from '@clerk/nextjs'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { getAllPlayers, getSelfId,sendCallNotification,registerSetShowCallNotification,registerSetCallerName,setCurrentStateStream
-		 ,currentState,setCurrentStateInfo,registerSetMyStreamCaller,RTCCallerEventEmitter,broadcastCallLeave
+		 ,currentState,setCurrentStateInfo,registerSetMyStreamCaller,RTCCallerEventEmitter,broadcastCallLeave,RTCEventEmitter
 		} from '@/game/realtime/PlayerRealtime'
 import { Users2, MessageSquareText, Video, ChevronRight, ChevronLeft } from "lucide-react"
 import TextChat from './TextChat'
@@ -32,6 +32,7 @@ export default function PlayersPanel({ inMeeting, setInMeeting, roomId }: Player
 	const { user } = useUser()
 	const { organization } = useOrganization()
 	const [members, setMembers] = useState<Array<{ id: string; name: string; role: string; }>>([])
+	const [activeCalls, setActiveCalls] = useState<Map<string, string>>(new Map()) // Map of playerId -> who they're in call with
 
 	const refresh = useCallback(() => {
 		const all = getAllPlayers()
@@ -148,6 +149,31 @@ export default function PlayersPanel({ inMeeting, setInMeeting, roomId }: Player
 	setCallerInfo(null);
 	setCurrentStateInfo(null)
 	})
+
+	// Track call state changes
+	useEffect(() => {
+		const handleCallStateChange = (data: { callerId: string; receiverId: string; inCall: boolean }) => {
+			setActiveCalls((prev) => {
+				const newMap = new Map(prev);
+				if (data.inCall) {
+					// Add call: both participants are in call with each other
+					newMap.set(data.callerId, data.receiverId);
+					newMap.set(data.receiverId, data.callerId);
+				} else {
+					// Remove call: both participants are no longer in call
+					newMap.delete(data.callerId);
+					newMap.delete(data.receiverId);
+				}
+				return newMap;
+			});
+		};
+
+		RTCEventEmitter.on("call-state-change", handleCallStateChange);
+
+		return () => {
+			RTCEventEmitter.removeAllListeners("call-state-change");
+		};
+	}, [])
 	
 	// Show max 5 avatars, collapse extras into "+N" avatar
 	const maxVisible = 5
@@ -167,12 +193,26 @@ const handleAcceptCall = useCallback(async() => {
 	// Empty handler as requested
 }, [])
 const handleLeaveCall= useCallback(async ()=>{
-
 	broadcastCallLeave();
 	setCallerStream(null);
+	const previousCallerId = callerInfo?.id;
 	setCallerInfo(null);
 	setCurrentStateInfo(null)
-},[])
+	// Stop user's own stream tracks if they exist
+	if (myStream) {
+		myStream.getTracks().forEach(track => track.stop());
+		setMyStream(null);
+	}
+	// Clear call state from activeCalls
+	if (previousCallerId && selfId) {
+		setActiveCalls((prev) => {
+			const newMap = new Map(prev);
+			newMap.delete(selfId);
+			newMap.delete(previousCallerId);
+			return newMap;
+		});
+	}
+},[callerInfo, selfId, myStream])
 const handleRejectCall = useCallback(() => {
 	setIsCallNotification(false);
 	setCurrentStateInfo(null)
@@ -374,6 +414,10 @@ const handleRejectCall = useCallback(() => {
 									// Get name from members list if available, otherwise fallback to p.name or p.id
 									const member = members.find(m => m.id === p.id);
 									const displayName = member?.name || p.name || p.id
+									// Check if this player is in a call
+									const isInCall = activeCalls.has(p.id)
+									// Check if current user is in a call (disable all call buttons if so)
+									const isCurrentUserInCall = selfId ? activeCalls.has(selfId) : false
 									return (
 										<div key={p.id} className="flex items-center gap-3 px-3 py-2">
 											<Avatar className="h-8 w-8">
@@ -384,14 +428,20 @@ const handleRejectCall = useCallback(() => {
 												<p className="text-sm text-slate-700 truncate">{displayName}{isCurrentUser ? ' (You)' : ''}</p>
 											</div>
 											<div>
-												<button
-													onClick={()=>{onCall(p.id)}}
-													disabled={isCurrentUser}
-													className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-semibold border shadow-sm transition transform active:scale-[0.98] focus:outline-none focus:ring-2 focus:ring-offset-0 ${isCurrentUser ? 'opacity-60 cursor-not-allowed border-slate-200 text-slate-400 bg-slate-50' : 'cursor-pointer border-violet-400 text-violet-900 bg-gradient-to-r from-violet-50 to-violet-100 hover:from-violet-100 hover:to-violet-200 hover:border-violet-500 shadow-violet-100/60 focus:ring-violet-300/40'}`}
-												>
-													<Video className="w-3.5 h-3.5" />
-													<span>Call</span>
-												</button>
+												{isInCall ? (
+													<div className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-semibold border shadow-sm border-green-400 text-green-700 bg-gradient-to-r from-green-50 to-green-100">
+														<span>In Call</span>
+													</div>
+												) : (
+													<button
+														onClick={()=>{onCall(p.id)}}
+														disabled={isCurrentUser || isCurrentUserInCall}
+														className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-semibold border shadow-sm transition transform active:scale-[0.98] focus:outline-none focus:ring-2 focus:ring-offset-0 ${isCurrentUser || isCurrentUserInCall ? 'opacity-60 cursor-not-allowed border-slate-200 text-slate-400 bg-slate-50' : 'cursor-pointer border-violet-400 text-violet-900 bg-gradient-to-r from-violet-50 to-violet-100 hover:from-violet-100 hover:to-violet-200 hover:border-violet-500 shadow-violet-100/60 focus:ring-violet-300/40'}`}
+													>
+														<Video className="w-3.5 h-3.5" />
+														<span>Call</span>
+													</button>
+												)}
 											</div>
 										</div>
 									)
@@ -405,7 +455,7 @@ const handleRejectCall = useCallback(() => {
 						</div>
 						{/* leave room and start meeting button*/}
 						<div className="mt-2 mb-2 grid grid-cols-1 gap-2">
-							<LeaveRoomButton roomId={roomId} />
+							<LeaveRoomButton roomId={roomId} onBeforeLeave={handleLeaveCall} />
 						</div>
 					</div>
 				</div>

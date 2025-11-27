@@ -28,19 +28,19 @@ type MeetingSummary = {
   id: string;
   room_id: string;
   org_id: string;
+  created_by?: string;
   summary_text: string;
   key_points: string[];
   participants: string[];
+  participant_names: Record<string, string>;
   duration_ms: number;
   start_time: string;
   end_time: string;
   created_at: string;
   transcriptions?: Array<{
-    participant_id: string;
-    transcription_text: string | null;
-    offset: number;
-    ended_at?: number;
-    confidence?: number | null;
+    id: string;
+    name?: string;
+    text: string;
   }>;
 };
 
@@ -282,10 +282,31 @@ export default function MeetingsPage() {
                           Participants
                         </h3>
                         <div className="flex flex-wrap gap-2">
-                          {summary.participants.map((participant, idx) => (
+                          {summary.participants.map((id, idx) => (
                             <Badge key={idx} variant="outline" className="text-xs">
-                              {participant}
+                              {summary.participant_names?.[id] || id}
                             </Badge>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {summary.transcriptions && summary.transcriptions.length > 0 && (
+                      <div className="space-y-3 mt-4">
+                        <h3 className="text-sm font-semibold text-muted-foreground">Transcriptions</h3>
+                        <div className="flex flex-col gap-3">
+                          {summary.transcriptions.map((t, idx) => (
+                            <div
+                              key={idx}
+                              className="rounded-md border border-muted/30 bg-muted/10 p-3"
+                            >
+                              <p className="text-sm font-medium text-foreground mb-1">
+                                🗣 {t.name || summary.participant_names?.[t.id] || t.id}
+                              </p>
+                              <p className="text-sm text-muted-foreground whitespace-pre-line">
+                                {t.text || '(no transcription available)'}
+                              </p>
+                            </div>
                           ))}
                         </div>
                       </div>
@@ -300,4 +321,3 @@ export default function MeetingsPage() {
     </div>
   );
 }
-

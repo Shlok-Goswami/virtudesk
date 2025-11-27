@@ -159,6 +159,7 @@ let setIsMeeting:null | React.Dispatch<React.SetStateAction<boolean>> =null
 let setShowInviteNotification:null | React.Dispatch<React.SetStateAction<boolean>> =null
 let setShowCallNotification:null | React.Dispatch<React.SetStateAction<boolean>> =null
 let setCallerName:null | React.Dispatch<React.SetStateAction<{name:string,id:string} | null>> =null
+let setShowJoinRequestNotification:null | React.Dispatch<React.SetStateAction<{name:string,id:string} | null>> =null
 
 
 export function registerSetMode(setState:null | React.Dispatch<React.SetStateAction<number>>){
@@ -183,6 +184,9 @@ export function registerSetShowCallNotification(setState:null | React.Dispatch<R
 }
 export function registerSetCallerName(setState:null | React.Dispatch<React.SetStateAction<{name:string,id:string} | null>>){
   setCallerName=setState
+}
+export function registerSetShowJoinRequestNotification(setState:null | React.Dispatch<React.SetStateAction<{name:string,id:string} | null>>){
+  setShowJoinRequestNotification=setState
 }
 export type PlayerInfo = { id: string; name?: string; character?: string; avatar?: string,mode?:ModeType }
 
@@ -332,12 +336,28 @@ export function broadCastUserNames(n:string){
       pendingFunction=n
     } 
 }
-export function broadcastMeetingState(a:boolean){
-  channel?.send({type:"broadcast",event:"meetingChange",payload:{flag:a}})
+export function broadcastMeetingState(a:boolean, hostId?: string){
+  channel?.send({type:"broadcast",event:"meetingChange",payload:{flag:a, hostId: hostId || playerIdRef}})
 }
 export function broadcastCallLeave(){
+  if (currentState.callerId) {
+    channel?.send({type:"broadcast",event:"Call-Ended",payload:{from:playerIdRef,to:currentState.callerId}})
+    // Broadcast that call has ended
+    broadcastCallState(playerIdRef!, currentState.callerId, false);
+  }
+}
 
-  channel?.send({type:"broadcast",event:"Call-Ended",payload:{from:playerIdRef,to:currentState.callerId}})
+export function broadcastCallState(callerId: string, receiverId: string, inCall: boolean) {
+  if (!channel || !playerIdRef) return;
+  channel.send({
+    type: "broadcast",
+    event: "call-state-change",
+    payload: {
+      callerId: callerId,
+      receiverId: receiverId,
+      inCall: inCall
+    }
+  });
 }
 export function handleMute(flag:boolean){
   for(const [key,value] of peersConnections){
@@ -360,6 +380,32 @@ export function sendMeetingInvite(to: string) {
     payload: {
       from: playerIdRef,
       to: to
+    }
+  });
+}
+
+export function sendJoinMeetingRequest(to: string, requesterName: string) {
+  if (!channel || !playerIdRef) return;
+  channel.send({
+    type: "broadcast",
+    event: "join-meeting-request",
+    payload: {
+      from: playerIdRef,
+      to: to,
+      requesterName: requesterName
+    }
+  });
+}
+
+export function sendJoinMeetingResponse(to: string, accepted: boolean) {
+  if (!channel || !playerIdRef) return;
+  channel.send({
+    type: "broadcast",
+    event: "join-meeting-response",
+    payload: {
+      from: playerIdRef,
+      to: to,
+      accepted: accepted
     }
   });
 }
@@ -474,6 +520,15 @@ class PeerService{
           RTCEventEmitter.emit("onTrack",this.from,event.track,this.mode)  
         }
       }
+      this.peer.onconnectionstatechange=()=>{
+        if(this.peer){
+          console.log(`[${this.from}] Connection state changed to: ${this.peer.connectionState}`)
+          if(this.peer.connectionState === 'disconnected' || this.peer.connectionState === 'failed' || this.peer.connectionState === 'closed'){
+            // Emit event to remove participant
+            RTCEventEmitter.emit("onParticipantDisconnect", this.from)
+          }
+        }
+      }
     }
   }
   async getOffer(){
@@ -489,7 +544,6 @@ class PeerService{
        
         this.dataChannels.set("mode",d1)
         this.dataChannels.set("mute",d2)
-        
       }
       const offer=await this.peer.createOffer()
       await this.peer.setLocalDescription(new RTCSessionDescription(offer))
@@ -499,7 +553,7 @@ class PeerService{
   async getAnswer(offer:RTCSessionDescriptionInit){
 
     if(this.peer){
-
+      // Remove existing tracks and add current stream tracks
       this.peer.getSenders().forEach((sender)=>{this.peer?.removeTrack(sender)});
       if(!currentState.stream){throw new Error("stream not defined in getAnswer method of PeerService")}
       currentState.stream.getTracks().forEach((track)=>{
@@ -555,10 +609,6 @@ class PeerService{
           this.queue=[];
         } catch (error) {
           console.error(`[SET LOCAL] Error setting remote description in state ${currentState}:`, error);
-          // If we're in wrong state, try to recover
-          if (currentState === "stable") {
-            console.warn(`[SET LOCAL] Connection is stable, might be a duplicate call. Ignoring.`);
-          }
         }
       } else {
         console.warn(`[SET LOCAL] Cannot set remote description in state: ${currentState}`);
@@ -590,7 +640,7 @@ export async function renegotiate(s:MediaStream,m:ModeType){
   for(let [key,value] of peersConnections){
     const Peer=value;
     const senders=Peer.peer?.getSenders()
-    senders?.forEach((s)=>{Peer.peer?.removeTrack(s)})
+    senders?.forEach((sender)=>{Peer.peer?.removeTrack(sender)})
     s.getTracks().forEach((t)=>{Peer.peer?.addTrack(t,s)})
     const offer=await Peer.getOffer();
     if(offer){
@@ -617,7 +667,8 @@ export async function createInitialOffer(participantId:string){
           channel?.send({type:"broadcast",event:"webrtc-initials",payload:{from:playerIdRef,to:Peer.from,sdp:offer}})
         }
         else{throw new Error("offer not defined in createInitialOffer method")}
-    }else{
+    }
+    else{
       if(!Peer){
         throw new Error("Peer is not defined in createInitialOffer")
       }
@@ -722,6 +773,9 @@ const data = payload as { from: string; to: string; name:string ,sdp?:RTCSession
     const answer = await Peer.getAnswer(offer);
     
     channel?.send({type:"broadcast",event:"Call-Accepted-ACK",payload:{from:playerIdRef,to:currentState.callerId,sdp:answer}})
+    // Broadcast that call is active (receiver accepted, waiting for ACK)
+    // We'll also broadcast in Call-Accepted-ACK, but this ensures state is set early
+    broadcastCallState(data.from, playerIdRef, true);
   }
 });
 channel.on("broadcast", { event: "Call-Accepted-ACK" }, async ({ payload }) => {
@@ -737,6 +791,8 @@ const data = payload as { from: string; to: string ,answer?:RTCSessionDescriptio
     }
     
     await currentState.callerService!.setLocal(answer);
+    // Broadcast that call is active (caller and receiver are in call)
+    broadcastCallState(data.to, data.from, true);
     
   }
 });
@@ -747,8 +803,18 @@ channel.on("broadcast", { event: "Call-Ended" }, async ({ payload }) => {
   if (!data.from || data.from === playerIdRef) return;
   if (data.to === playerIdRef) {
     RTCCallerEventEmitter.emit("onCallLeave")
+    // Broadcast that call has ended
+    broadcastCallState(data.from, data.to, false);
   }
 })
+
+// Call state change listener
+channel.on("broadcast", { event: "call-state-change" }, async ({ payload }) => {
+  const data = payload as { callerId: string; receiverId: string; inCall: boolean };
+  if (!data.callerId || !data.receiverId) return;
+  // Emit event so components can track call state
+  RTCEventEmitter.emit("call-state-change", data);
+});
 channel.on("broadcast", { event: "Caller-Webrtc-ICE" }, async ({ payload }) => {
 const data = payload as { from: string; to: string ,ICE:string};
 
@@ -799,9 +865,15 @@ channel.on("broadcast",{event : "onUserName-ACK"},async({payload})=>{
   })
 });
 channel.on("broadcast",{event:"meetingChange"},async({payload})=>{
-  const data= payload as {flag:boolean}
+  const data= payload as {flag:boolean, hostId?: string}
   if(!setIsMeeting){throw new  Error("setIsMeeting not defined")}
   setIsMeeting(data.flag)
+  // Emit event with host ID if provided
+  if (data.flag && data.hostId) {
+    RTCEventEmitter.emit("meeting-started", data.hostId);
+  } else if (!data.flag) {
+    RTCEventEmitter.emit("meeting-ended");
+  }
 });
 
 // Meeting invite notifications
@@ -811,6 +883,35 @@ channel.on("broadcast", { event: "meeting-invite" }, async ({ payload }) => {
   if (data.to === playerIdRef) {
     if(setShowInviteNotification){
       setShowInviteNotification(true);
+    }
+  }
+});
+
+// Join meeting request notifications
+channel.on("broadcast", { event: "join-meeting-request" }, async ({ payload }) => {
+  const data = payload as { from: string; to: string; requesterName: string };
+  if (!data.from || data.from === playerIdRef) return;
+  if (data.to === playerIdRef) {
+    if(setShowJoinRequestNotification){
+      setShowJoinRequestNotification({
+        name: data.requesterName || "Someone",
+        id: data.from
+      });
+    }
+  }
+});
+
+// Join meeting response notifications
+channel.on("broadcast", { event: "join-meeting-response" }, async ({ payload }) => {
+  const data = payload as { from: string; to: string; accepted: boolean };
+  if (!data.from || data.from === playerIdRef) return;
+  if (data.to === playerIdRef) {
+    if (data.accepted) {
+      // The request was accepted, trigger join meeting
+      RTCEventEmitter.emit("join-meeting-accepted");
+    } else {
+      // The request was rejected
+      RTCEventEmitter.emit("join-meeting-rejected");
     }
   }
 });
